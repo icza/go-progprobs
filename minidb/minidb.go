@@ -36,7 +36,7 @@ const (
 	PathReservations = "/reservations/" // Path of the /reservations/ endpoint
 	PathValues       = "/values/"       // Path of the /values/ endpoint
 	Port             = 8080             // Port to listen on
-	LockIdLength     = 16               // Lenght of lock ids (in bytes, will be double when encoded to hex)
+	LockIdLength     = 16               // Length of lock ids (in bytes, will be double when encoded to hex)
 )
 
 // valueWr struct is a wrapper which holds the value and its lock
@@ -59,14 +59,14 @@ func (vw *valueWr) Lock() {
 	vw.LockId = genLockId()
 }
 
-// Unlock releases the lock for the value.
+// Unlock releases the lock for the value and invalidates previous lock id.
 func (vw *valueWr) Unlock() {
 	vw.LockId = ""
 	vw.Mux.Unlock()
 }
 
-// sendJsonResp sends a JSON response inlcuding the LockId, and optionally the value.
-func (vw *valueWr) SendJsonResp(w http.ResponseWriter, sendValue bool) error {
+// SendJSONResp sends a JSON response inlcuding the LockId, and optionally the Value.
+func (vw *valueWr) SendJSONResp(w http.ResponseWriter, sendValue bool) error {
 	w.Header().Set("Content-Type", "application/json")
 	m := map[string]string{"lock_id": vw.LockId}
 	if sendValue {
@@ -76,14 +76,14 @@ func (vw *valueWr) SendJsonResp(w http.ResponseWriter, sendValue bool) error {
 }
 
 // The in-memory store realized with a map which maps from key (string)
-// to *Entry which contains the value ([]byte) and also the lock
+// to *valueWr which contains the value (string) and also its the lock.
 var store = make(map[string]*valueWr)
 
-// Mutex used to synchronize access to the store
+// Mutex used to synchronize access to the store.
 var storeMux = &sync.RWMutex{} // RWMutex which would allow efficient read-only locking for future read-only queries
 
 // reservationsHandler is a request handler which handles the endpoint
-// mapped to /reservations
+// mapped to /reservations/.
 func reservationsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Bad request, POST method expected!", http.StatusBadRequest)
@@ -104,18 +104,16 @@ func reservationsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Wait to be available and acquire lock:
 	vw.Lock()
-	vw.SendJsonResp(w, true)
+	vw.SendJSONResp(w, true)
 }
 
 // valuesHandler is a request handler which handles the endpoints
-// mapped to /values.
+// mapped to /values/.
 func valuesHandler(w http.ResponseWriter, r *http.Request) {
 	// 0: empty, 1: "values", 2: key, 3: lockId
 	parts := strings.Split(r.URL.Path, "/")
-	log.Printf("%q", parts)
 	// We expect key in all cases
 	key := parts[2] // If there is no key, this will be empty string
-
 	if err := checkKey(key); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -142,12 +140,11 @@ func valuesHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		_ = readBody(vw, r) // We ignore returned error
+		readBody(vw, r) // We ignore returned error
 		if release == "true" {
 			vw.Unlock()
 		}
 		w.WriteHeader(http.StatusNoContent)
-		return
 	case http.MethodPut:
 		// PUT /values/{key}
 		vw := store[key]
@@ -156,14 +153,12 @@ func valuesHandler(w http.ResponseWriter, r *http.Request) {
 			vw = &valueWr{Mux: &sync.Mutex{}}
 			store[key] = vw
 		}
-		// Acqire lock
+		// Acquire lock
 		vw.Lock()
-		_ = readBody(vw, r) // Spec says to always return 200, so we ignore returned error
-		vw.SendJsonResp(w, false)
-		return
+		readBody(vw, r) // Spec says to always return 200, so we ignore returned error
+		vw.SendJSONResp(w, false)
 	default:
 		http.Error(w, "Bad request, POST or PUT method expected!", http.StatusBadRequest)
-		return
 	}
 }
 
