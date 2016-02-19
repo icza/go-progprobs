@@ -36,6 +36,7 @@ const (
 	PathReservations = "/reservations/" // Path of the /reservations/ endpoint
 	PathValues       = "/values/"       // Path of the /values/ endpoint
 	Port             = 8080             // Port to listen on
+	LockIdLength     = 16               // Lenght of lock ids (in bytes, will be double when encoded to hex)
 )
 
 // valueWr struct is a wrapper which holds the value and its lock
@@ -45,9 +46,38 @@ type valueWr struct {
 	Mux    *sync.Mutex // Lock used to maintain mutual exclusion
 }
 
+// Lock waits for the value to be available and acquires the lock,
+// and generates a new lock id.
+// Should only be called from a handler (because it unlocks store mutex while waiting).
+func (vw *valueWr) Lock() {
+	// While we wait, we have to release the store mutex
+	// else noone else would be able to release the value we're waiting for:
+	storeMux.Unlock()
+	defer storeMux.Lock()
+
+	vw.Mux.Lock()
+	vw.LockId = genLockId()
+}
+
+// Unlock releases the lock for the value.
+func (vw *valueWr) Unlock() {
+	vw.LockId = ""
+	vw.Mux.Unlock()
+}
+
+// sendJsonResp sends a JSON response inlcuding the LockId, and optionally the value.
+func (vw *valueWr) SendJsonResp(w http.ResponseWriter, sendValue bool) error {
+	w.Header().Set("Content-Type", "application/json")
+	m := map[string]string{"lock_id": vw.LockId}
+	if sendValue {
+		m["value"] = vw.Value
+	}
+	return json.NewEncoder(w).Encode(m)
+}
+
 // The in-memory store realized with a map which maps from key (string)
 // to *Entry which contains the value ([]byte) and also the lock
-var store map[string]*valueWr
+var store = make(map[string]*valueWr)
 
 // Mutex used to synchronize access to the store
 var storeMux = &sync.RWMutex{} // RWMutex which would allow efficient read-only locking for future read-only queries
@@ -61,54 +91,91 @@ func reservationsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// POST /reservations/{key}
+	key := r.URL.Path[len(PathReservations):] // Path length is at least len(PathReservations) else we wouldn't be here
 
-	w.Write([]byte(r.URL.Path))
+	storeMux.Lock()
+	defer storeMux.Unlock()
+
+	vw := store[key]
+	if vw == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Wait to be available and acquire lock:
+	vw.Lock()
+	vw.SendJsonResp(w, true)
 }
 
 // valuesHandler is a request handler which handles the endpoints
 // mapped to /values.
 func valuesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		// TODO uncomment
-		//http.Error(w, "Bad request, POST or PUT method expected!", http.StatusBadRequest)
-		//return
-	}
+	// 0: empty, 1: "values", 2: key, 3: lockId
+	parts := strings.Split(r.URL.Path, "/")
+	log.Printf("%q", parts)
+	// We expect key in all cases
+	key := parts[2] // If there is no key, this will be empty string
 
-	key := r.URL.Path[len(PathValues):] // Path is at least len(PathValues) long, else we would not be called
 	if err := checkKey(key); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if r.Method == http.MethodPut {
-		// PUT /values/{key}
-		storeMux.Lock()
+	storeMux.Lock()
+	defer storeMux.Unlock()
+
+	switch r.Method {
+	case http.MethodPost:
+		// POST /values/{key}/{lock_id}?release={true, false}
+		release := r.URL.Query().Get("release")
+		// According to spec, if release is neither "true" nor "false", nothing should be set
+		if len(parts) < 4 || (release != "false" && release != "true") {
+			http.Error(w, "Bad request, missing lockId and/or release parameter (must be 'true' or 'false')!", http.StatusBadRequest)
+			return
+		}
 		vw := store[key]
 		if vw == nil {
-			// Key doesn't already exist: create and lock
-			vw = &valueWr{LockId: genLockId(), Mux: &sync.Mutex{}}
+			http.NotFound(w, r)
+			return
+		}
+		if vw.LockId != parts[3] {
+			http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = readBody(vw, r) // We ignore returned error
+		if release == "true" {
+			vw.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case http.MethodPut:
+		// PUT /values/{key}
+		vw := store[key]
+		if vw == nil {
+			// Key doesn't exist yet: create
+			vw = &valueWr{Mux: &sync.Mutex{}}
 			store[key] = vw
 		}
-		vw.Mux.Lock()
-		// Body is the value:
-		content, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			// We should return an error, something like http.StatusInternalServerError (and unlock storeMux),
-			// But spec says to always return 200 OK.
-		}
-		vw.Value = string(content)
-		storeMux.Unlock()
-	} else {
-		// POST /values/{key}/{lock_id}?release={true, false}
+		// Acqire lock
+		vw.Lock()
+		_ = readBody(vw, r) // Spec says to always return 200, so we ignore returned error
+		vw.SendJsonResp(w, false)
+		return
+	default:
+		http.Error(w, "Bad request, POST or PUT method expected!", http.StatusBadRequest)
+		return
 	}
-
-	w.Write([]byte(r.URL.Path))
 }
 
-// sendJsonResp sends a JSON response, marshaling the specified value.
-func sendJsonResp(w http.ResponseWriter, v interface{}) error {
-	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(v)
+// readBody reads the request body and sets it as the new value.
+func readBody(vw *valueWr, r *http.Request) error {
+	content, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println("Error reading request body:", err)
+		return err
+	}
+	vw.Value = string(content)
+	return nil
 }
 
 var (
@@ -117,7 +184,6 @@ var (
 )
 
 // checkKey checks the specified key and reports if it is not valid.
-// For example since key
 func checkKey(key string) error {
 	if key == "" {
 		return ErrKeyMissing
@@ -130,10 +196,9 @@ func checkKey(key string) error {
 
 // genLockId generates a new, unique lock id.
 func genLockId() string {
-	buf := make([]byte, 16)
+	buf := make([]byte, LockIdLength)
 	if _, err := rand.Read(buf); err != nil {
-		// TODO handle this
-		log.Println("")
+		log.Println("Error reading secure random:", err)
 	}
 	return hex.EncodeToString(buf)
 }
@@ -147,6 +212,6 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", Port)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Printf("Failed to start server: %v", err)
+		log.Println("Failed to start server:", err)
 	}
 }
